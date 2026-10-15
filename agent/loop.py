@@ -1,88 +1,69 @@
-import os
+import os, json
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 from agent.prompts import SYSTEM
 from tools import find_failed_login_spikes, search_logs, get_user_timeline, check_ip_reputation
-import json, pathlib
-
-
-import time
 
 load_dotenv(override=True)
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_STEPS = 10
-FALLBACKS = list(dict.fromkeys([MODEL]))
-CACHE = pathlib.Path(__file__).resolve().parent.parent / "data" / "last_run.json"
 
 TOOLS = {f.__name__: f for f in
          (find_failed_login_spikes, search_logs, get_user_timeline, check_ip_reputation)}
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-config = types.GenerateContentConfig(
-    system_instruction=SYSTEM,
-    tools=list(TOOLS.values()),
-    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-)
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-def _investigate_live(question: str):
-    """Runs the agent loop. Yields events so a UI can show each step live."""
-    contents = [types.Content(role="user", parts=[types.Part(text=question)])]
-    for step in range(1, MAX_STEPS + 1):
-        resp = _generate(contents)
-        msg = resp.candidates[0].content
-        contents.append(msg)                      # keep the model's turn exactly as returned
-        calls = [p.function_call for p in (msg.parts or []) if p.function_call]
-        if not calls:
-            text = "".join(p.text for p in (msg.parts or []) if p.text)
-            yield {"type": "final", "step": step, "text": text}
-            return
-        results = []
-        for c in calls:
-            args = dict(c.args or {})
-            yield {"type": "tool_call", "step": step, "name": c.name, "args": args}
-            try:
-                out = TOOLS[c.name](**args)
-            except Exception as e:
-                out = {"error": str(e)}
-            yield {"type": "tool_result", "step": step, "name": c.name, "result": out}
-            results.append(types.Part.from_function_response(name=c.name, response={"result": out}))
-        contents.append(types.Content(role="user", parts=results))
-    yield {"type": "final", "step": MAX_STEPS, "text": "Stopped: reached the step limit."}
+def _fn(name, desc, props, required=()):
+    return {"type": "function", "function": {"name": name, "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": list(required)}}}
+
+S = {"type": "string"}
+I = {"type": "integer"}
+SCHEMAS = [
+    _fn("find_failed_login_spikes", "Find IP and username pairs with many failed logins. Use this first to spot brute-force attacks.",
+        {"min_count": I}),
+    _fn("search_logs", "Search log events. source is auth, web or db. start and end are ISO times like 2026-10-12T02:00:00.",
+        {"ip": S, "user": S, "source": S, "status": S, "start": S, "end": S, "limit": I}),
+    _fn("get_user_timeline", "Get a user's important events: logins, db queries and exports, in time order.",
+        {"user": S, "start": S, "end": S}, ["user"]),
+    _fn("check_ip_reputation", "Check whether an IP address is known to be malicious.",
+        {"ip": S}, ["ip"]),
+]
 
 def investigate(question: str):
-    events = []
-    try:
-        for ev in _investigate_live(question):
-            events.append(ev)
-            yield ev
-        CACHE.write_text(json.dumps(events, default=str))   # save after a full successful run
-    except RuntimeError:
-        if events or not CACHE.exists():
-            raise                                           # failed mid-run, or nothing saved yet
-        for ev in json.loads(CACHE.read_text()):            # API down: replay the last good run
-            yield ev
-
-def _generate(contents):
-    last = None
-    for model in FALLBACKS:
-        for attempt in range(5):
+    """Runs the agent loop. Yields events so a UI can show each step live."""
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+    for step in range(1, MAX_STEPS + 1):
+        last = step == MAX_STEPS
+        if last:
+            messages.append({"role": "user", "content": "Step limit reached. Do not call more tools. Write the final incident report now from the evidence gathered."})
+        resp = client.chat.completions.create(model=MODEL, messages=messages, tools=SCHEMAS,
+                                              tool_choice="none" if last else "auto", temperature=0.2)
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            yield {"type": "final", "step": step, "text": msg.content or ""}
+            return
+        messages.append({"role": "assistant", "content": msg.content or "",
+                         "tool_calls": [{"id": tc.id, "type": "function",
+                                         "function": {"name": tc.function.name,
+                                                      "arguments": tc.function.arguments}}
+                                        for tc in msg.tool_calls]})
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments or "{}")
+            for k in ("min_count", "limit"):
+                if k in args:
+                    args[k] = int(args[k])
+            yield {"type": "tool_call", "step": step, "name": tc.function.name, "args": args}
             try:
-                return client.models.generate_content(model=model, contents=contents, config=config)
+                out = TOOLS[tc.function.name](**args)
             except Exception as e:
-                last = e
-                s = str(e)
-                if "404" in s or "NOT_FOUND" in s:
-                    break                          # model not usable, try the next one
-                if "503" in s or "UNAVAILABLE" in s or "429" in s:
-                    time.sleep(min(2 ** attempt, 16))   # 1, 2, 4, 8, 16 seconds
-                    continue
-                raise
-    raise RuntimeError(f"All models unavailable. Last error: {last}")
+                out = {"error": str(e)}
+            yield {"type": "tool_result", "step": step, "name": tc.function.name, "result": out}
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(out)[:6000]})
+    yield {"type": "final", "step": MAX_STEPS, "text": "Stopped: reached the step limit."}
 
 if __name__ == "__main__":
-    q = "Was there a security breach last night? Investigate the logs."
-    for ev in investigate(q):
+    for ev in investigate("Was there a security breach last night? Investigate the logs."):
         if ev["type"] == "tool_call":
             print(f"\n[step {ev['step']}] calling {ev['name']} {ev['args']}")
         elif ev["type"] == "tool_result":
